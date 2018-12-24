@@ -25,11 +25,13 @@
 #include <Library/UefiRuntimeServicesTableLib.h>
 #include <Protocol/HiiDatabase.h>
 
+#include <sys/stdint.h>
+
 #define HIIDB_VAR_NAME L"HiiDB"
 
 typedef struct HiiDbExportVar {
-    UINTN length;
-    void * pointer;
+    UINT32 length;
+    UINT32 pointer;
 } exportvar_t;
 
 INTN
@@ -67,8 +69,8 @@ ShellAppMain (IN UINTN Argc, IN CHAR16 **Argv) {
         }
 
         exportvar_t var;
-        var.length = DataSize;
-        var.pointer = HiiPackageList;
+        var.length = (UINT32)(DataSize & 0xFFFFFFFF);
+        var.pointer = (UINT32)((uintptr_t)HiiPackageList & 0xFFFFFFFF);
 
         status = gRT->SetVariable(HIIDB_VAR_NAME, &HiiDatabaseGuid,
                 EFI_VARIABLE_RUNTIME_ACCESS |

@@ -24,7 +24,7 @@
   BASE_NAME                      = hiidb
   FILE_GUID                      = 58a4c85b-fce4-4353-95e0-85fbc80e119f
   MODULE_TYPE                    = UEFI_APPLICATION
-  VERSION_STRING                 = 1.0.0
+  VERSION_STRING                 = 1.0.1
   ENTRY_POINT                    = ShellCEntryLib
 
 [Sources]
