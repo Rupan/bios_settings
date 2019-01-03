@@ -23,19 +23,20 @@
 ##
 
 import os
-import io
 import sys
 import enum
 import struct
 import click
 
 from pathlib import Path
+from typing import Union, Tuple
 
 
 # Struct definitions are based upon C structures from the EDK2 in:
 #   EdkCompatibilityPkg/Foundation/Efi/Include/EfiTypes.h
 EFI_GUID = struct.Struct('=LHHBBBBBBBB')
 UINT32 = struct.Struct('=L')
+UINT16 = struct.Struct('=H')
 
 
 # All package types for the EFI_HII_PACKAGE_HEADER type field
@@ -64,7 +65,7 @@ class HIIDBError(Exception):
     pass
 
 
-def read_hii_data():
+def read_hii_data() -> bytes:
     if os.geteuid() != 0:
         raise HIIDBError('Reading the HII database requires root access')
     data_path = EFI_VARS_ROOT / 'HiiDB-{}'.format(EFI_HII_DATABASE_PROTOCOL_GUID)
@@ -83,31 +84,92 @@ def read_hii_data():
     return hii_database
 
 
-def parse_hii_package_list(hii_fd: io.BytesIO):
-    """
-    Deserialize one package list from the HII database, consisting of:
-        1 EFI_HII_PACKAGE_LIST_HEADER
-        N EFI_HII_PACKAGE_HEADER
-    The package list should be terminated by HIIPackageTypes.PACKAGE_END
-    :param hii_fd: a file-like object which the HII data can be read from
-    :return: a 2-tuple of (package list guid, N-tuple of packages)
-    """
-    start_offset = hii_fd.tell()
-    package_list_guid = EFI_GUID.unpack(hii_fd.read(EFI_GUID.size))
-    package_list_size, = UINT32.unpack(hii_fd.read(UINT32.size))
-    end_offset = start_offset + package_list_size
-    packages = []
-    while hii_fd.tell() < end_offset:
-        package_header, = UINT32.unpack(hii_fd.read(UINT32.size))
-        package_size = (package_header & 0xFFFFFF) - UINT32.size
-        package_type = HIIPackageTypes((package_header >> 24) & 0xFF)
-        if package_size > 0:
-            package_data = hii_fd.read(package_size)
-        else:
-            package_data = None
-        packages.append((package_type, package_data))
-    assert hii_fd.tell() == end_offset
-    return package_list_guid, tuple(packages)
+class HIIPackage(object):
+
+    def __init__(self, package_type: HIIPackageTypes, package_blob: bytes):
+        self._package_type = package_type
+        self._package_blob = package_blob
+
+    @property
+    def package_type(self) -> HIIPackageTypes:
+        return self._package_type
+
+
+class HIIPackageList(object):
+
+    def __init__(self, pl_blob: bytes):
+        """
+        Container and decoder for one HII package list.
+        :param pl_blob: The package list as a serialized data blob
+        """
+        self._pl_blob = pl_blob
+        self._guid = None
+        self._packages = None
+
+    @property
+    def guid(self) -> str:
+        """
+        Return a string representation of the package list GUID.
+        """
+        if self._guid is None:
+            self._guid = '-'.join((
+                self._pl_blob[0:4].hex(), self._pl_blob[4:6].hex(),
+                self._pl_blob[6:8].hex(), self._pl_blob[8:16].hex()
+            ))
+        return self._guid
+
+    @property
+    def packages(self) -> Tuple[HIIPackage]:
+        """
+        Return an iterable representing all packages in the package list blob.
+        """
+        if self._packages is None:
+            packages = []
+            start_offset = 20
+            while start_offset < len(self._pl_blob):
+                if (start_offset+4) > len(self._pl_blob):
+                    raise HIIDBError('Insufficient data for next package header')
+                package_header, = UINT32.unpack(
+                    self._pl_blob[start_offset:start_offset+4]
+                )
+                package_size = package_header & 0xFFFFFF
+                end_offset = start_offset+package_size
+                if end_offset > len(self._pl_blob):
+                    raise HIIDBError('Insufficient data for next package')
+                package_type = HIIPackageTypes((package_header >> 24) & 0xFF)
+                package_blob = self._pl_blob[start_offset:end_offset]
+                packages.append(HIIPackage(package_type, package_blob))
+                start_offset += package_size
+            if start_offset != len(self._pl_blob):
+                raise HIIDBError('Package list encoding problem (corrupt data?)')
+            self._packages = tuple(packages)
+        return self._packages
+
+    @classmethod
+    def scan(cls, hii_blob: Union[None, bytes]=None) -> Tuple:
+        """
+        Deserialize all package lists from the HII database.
+        :param hii_blob: The serialized HII database
+        :return: An n-tuple of HIIPackageList objects
+        """
+        if hii_blob is None:
+            hii_blob = read_hii_data()
+        start_offset = 0
+        packages = []
+        while start_offset < len(hii_blob):
+            if (start_offset+20) > len(hii_blob):
+                raise HIIDBError('Insufficient data for next package list header')
+            package_list_size, = UINT32.unpack(
+                hii_blob[start_offset+16:start_offset+20]
+            )
+            end_offset = start_offset + package_list_size
+            if end_offset > len(hii_blob):
+                raise HIIDBError('Insufficient data for next package list')
+            packages.append(cls(hii_blob[start_offset:end_offset]))
+            start_offset += package_list_size
+        if start_offset != len(hii_blob):
+            raise HIIDBError('HII database encoding problem (corrupt data?)')
+        return tuple(packages)
 
 
 @click.command()
@@ -119,9 +181,11 @@ def _main(dump_db):
             hii_database = read_hii_data()
             with open(dump_db, 'wb') as hii_fd:
                 hii_fd.write(hii_database)
-            hii_fd = io.BytesIO(hii_database)
-            while hii_fd.tell() < len(hii_database):
-                parse_hii_package_list(hii_fd)
+            package_lists = HIIPackageList.scan(hii_database)
+            for package_list in package_lists:
+                print(package_list.guid)
+                for package in package_list.packages:
+                    print('  ' + package.package_type.name)
             return 0
         except HIIDBError as hii_err:
             print('ERROR: ' + str(hii_err))
