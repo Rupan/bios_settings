@@ -22,6 +22,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ##
 
+import io
 import os
 import sys
 import enum
@@ -30,13 +31,6 @@ import click
 
 from pathlib import Path
 from typing import Union, Tuple
-
-
-# Struct definitions are based upon C structures from the EDK2 in:
-#   EdkCompatibilityPkg/Foundation/Efi/Include/EfiTypes.h
-EFI_GUID = struct.Struct('=LHHBBBBBBBB')
-UINT32 = struct.Struct('=L')
-UINT16 = struct.Struct('=H')
 
 
 # All package types for the EFI_HII_PACKAGE_HEADER type field
@@ -54,6 +48,26 @@ class HIIPackageTypes(enum.Enum):
     PACKAGE_END = 0xDF
     TYPE_SYSTEM_BEGIN = 0xE0
     TYPE_SYSTEM_END = 0xFF
+
+
+# See section 32.3.6.2 - String Information
+class StringInfoBlockTypes(enum.Enum):
+    END = 0x00
+    STRING_SCSU = 0x10
+    STRING_SCSU_FONT = 0x11
+    STRINGS_SCSU = 0x12
+    STRINGS_SCSU_FONT = 0x13
+    STRING_UCS2 = 0x14
+    STRING_UCS2_FONT = 0x15
+    STRINGS_UCS2 = 0x16
+    STRINGS_UCS2_FONT = 0x17
+    DUPLICATE = 0x20
+    SKIP2 = 0x21
+    SKIP1 = 0x22
+    EXT1 = 0x30
+    EXT2 = 0x31
+    EXT4 = 0x32
+    FONT = 0x40
 
 
 EFI_HII_DATABASE_PROTOCOL_GUID = 'ef9fc172-a1b2-4693-b327-6d32fc416042'
@@ -89,10 +103,111 @@ class HIIPackage(object):
     def __init__(self, package_type: HIIPackageTypes, package_blob: bytes):
         self._package_type = package_type
         self._package_blob = package_blob
+        self._package_items = None
 
     @property
     def package_type(self) -> HIIPackageTypes:
         return self._package_type
+
+    def _parse_device_paths(self):
+        # See section 10.3.1 -- EFI_DEVICE_PATH_PROTOCOL
+        offset = 4  # type and length packed into an unsigned int
+        package_items = []
+        while offset < len(self._package_blob):
+            dp_length, = struct.unpack(
+                '=H', self._package_blob[offset+2:offset+4]
+            )
+            package_items.append(self._package_blob[offset:offset+dp_length])
+            offset += dp_length
+        assert offset == len(self._package_blob)
+        self._package_items = tuple(package_items)
+
+    def _parse_strings(self):
+        header_size, string_info_offset = struct.unpack(
+            '=LL', self._package_blob[4:12]
+        )
+        assert header_size == string_info_offset
+        package_fd = io.BytesIO(self._package_blob)
+        package_fd.seek(header_size, os.SEEK_SET)
+        package_items = []
+        block_type = None
+        while block_type != StringInfoBlockTypes.END:
+            start_offset = package_fd.tell()
+            block_type = StringInfoBlockTypes(
+                struct.unpack('=B', package_fd.read(1))[0]
+            )
+            if block_type == StringInfoBlockTypes.STRING_UCS2:
+                while package_fd.read(2) != b'\x00\x00':
+                    pass
+            elif block_type == StringInfoBlockTypes.END:
+                pass
+            elif block_type == StringInfoBlockTypes.SKIP1:
+                package_fd.seek(1, os.SEEK_CUR)
+            elif block_type == StringInfoBlockTypes.SKIP2:
+                package_fd.seek(2, os.SEEK_CUR)
+            elif block_type == StringInfoBlockTypes.DUPLICATE:
+                package_fd.seek(2, os.SEEK_CUR)
+            elif block_type == StringInfoBlockTypes.EXT1:
+                package_fd.seek(1, os.SEEK_CUR)
+            elif block_type == StringInfoBlockTypes.EXT2:
+                package_fd.seek(2, os.SEEK_CUR)
+            elif block_type == StringInfoBlockTypes.EXT4:
+                package_fd.seek(4, os.SEEK_CUR)
+            else:
+                raise HIIDBError(
+                    'Unsupported string info block type {}'.format(block_type)
+                )
+            package_items.append(
+                self._package_blob[start_offset:package_fd.tell()]
+            )
+        assert package_fd.tell() == len(self._package_blob)
+        self._package_items = tuple(package_items)
+
+    def _parse_simple_fonts(self):
+        # See section 32.3.2.1 -- EFI_HII_SIMPLE_FONT_PACKAGE_HDR
+        package_fd = io.BytesIO(self._package_blob)
+        package_fd.seek(4, os.SEEK_SET)
+        ng_count, wg_count = struct.unpack('=HH', package_fd.read(4))
+        narrow_glyphs = []
+        while ng_count > 0:
+            narrow_glyphs.append((
+                package_fd.read(2).decode('UTF-16'),
+                ord(package_fd.read(1)),
+                package_fd.read(19)
+            ))
+            ng_count -= 1
+        wide_glyphs = []
+        while wg_count > 0:
+            wide_glyphs.append((
+                package_fd.read(2).decode('UTF-16'),
+                ord(package_fd.read(1)),
+                package_fd.read(19),
+                package_fd.read(19),
+            ))
+            package_fd.seek(3, os.SEEK_CUR)
+            wg_count -= 1
+        assert package_fd.tell() == len(self._package_blob)
+        self._package_items = (tuple(narrow_glyphs), tuple(wide_glyphs))
+
+    def _parse_forms(self):
+        self._package_items = ()
+
+    @property
+    def items(self):
+        if self._package_items is None:
+            if self._package_type == HIIPackageTypes.STRINGS:
+                self._parse_strings()
+            elif self._package_type == HIIPackageTypes.DEVICE_PATH:
+                self._parse_device_paths()
+            elif self._package_type == HIIPackageTypes.PACKAGE_END:
+                self._package_items = ()
+            elif self._package_type == HIIPackageTypes.SIMPLE_FONTS:
+                self._parse_simple_fonts()
+            elif self._package_type == HIIPackageTypes.FORMS:
+                self._parse_forms()
+            else:
+                raise HIIDBError('Unsupported package type')
+        return self._package_items
 
 
 class HIIPackageList(object):
@@ -125,12 +240,12 @@ class HIIPackageList(object):
         """
         if self._packages is None:
             packages = []
-            start_offset = 20
+            start_offset = 20  # 16 bytes GUID + 4 bytes length
             while start_offset < len(self._pl_blob):
                 if (start_offset+4) > len(self._pl_blob):
                     raise HIIDBError('Insufficient data for next package header')
-                package_header, = UINT32.unpack(
-                    self._pl_blob[start_offset:start_offset+4]
+                package_header, = struct.unpack(
+                    '=L', self._pl_blob[start_offset:start_offset+4]
                 )
                 package_size = package_header & 0xFFFFFF
                 end_offset = start_offset+package_size
@@ -155,21 +270,21 @@ class HIIPackageList(object):
         if hii_blob is None:
             hii_blob = read_hii_data()
         start_offset = 0
-        packages = []
+        package_lists = []
         while start_offset < len(hii_blob):
             if (start_offset+20) > len(hii_blob):
                 raise HIIDBError('Insufficient data for next package list header')
-            package_list_size, = UINT32.unpack(
-                hii_blob[start_offset+16:start_offset+20]
+            package_list_size, = struct.unpack(
+                '=L', hii_blob[start_offset+16:start_offset+20]
             )
             end_offset = start_offset + package_list_size
             if end_offset > len(hii_blob):
                 raise HIIDBError('Insufficient data for next package list')
-            packages.append(cls(hii_blob[start_offset:end_offset]))
+            package_lists.append(cls(hii_blob[start_offset:end_offset]))
             start_offset += package_list_size
         if start_offset != len(hii_blob):
             raise HIIDBError('HII database encoding problem (corrupt data?)')
-        return tuple(packages)
+        return tuple(package_lists)
 
 
 @click.command()
@@ -185,7 +300,9 @@ def _main(dump_db):
             for package_list in package_lists:
                 print(package_list.guid)
                 for package in package_list.packages:
-                    print('  ' + package.package_type.name)
+                    print('  {}: {}'.format(package.package_type, len(package.items)))
+            with open('/tmp/PACKAGE', 'wb') as package_fd:
+                package_fd.write(package_lists[0].packages[0]._package_blob)
             return 0
         except HIIDBError as hii_err:
             print('ERROR: ' + str(hii_err))
