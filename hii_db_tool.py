@@ -111,15 +111,24 @@ class HIIPackage(object):
 
     def _parse_device_paths(self):
         # See section 10.3.1 -- EFI_DEVICE_PATH_PROTOCOL
-        offset = 4  # type and length packed into an unsigned int
         package_items = []
-        while offset < len(self._package_blob):
-            dp_length, = struct.unpack(
-                '=H', self._package_blob[offset+2:offset+4]
-            )
-            package_items.append(self._package_blob[offset:offset+dp_length])
-            offset += dp_length
-        assert offset == len(self._package_blob)
+        package_fd = io.BytesIO(self._package_blob)
+        # type and length packed into an unsigned int
+        package_fd.seek(4, os.SEEK_SET)
+        while package_fd.tell() < len(self._package_blob):
+            if (package_fd.tell() + 4) > len(self._package_blob):
+                raise HIIDBError('Insufficient data for device path header')
+            dp_header = struct.unpack('=BBH', package_fd.read(4))
+            # Magic number: End of Hardware Device Path
+            if dp_header[0] == 0x7F:
+                break
+            body_len = dp_header[2] - 4
+            if (package_fd.tell() + body_len) > len(self._package_blob):
+                raise HIIDBError('Insufficient data for device path body')
+            dp_data = package_fd.read(body_len)
+            package_items.append(dp_header[:2] + (dp_data,))
+        if package_fd.tell() != len(self._package_blob):
+            raise HIIDBError('Device path package could not be parsed')
         self._package_items = tuple(package_items)
 
     def _parse_strings(self):
@@ -170,6 +179,8 @@ class HIIPackage(object):
         ng_count, wg_count = struct.unpack('=HH', package_fd.read(4))
         narrow_glyphs = []
         while ng_count > 0:
+            if (package_fd.tell() + 22) > len(self._package_blob):
+                raise HIIDBError('Insufficient data for next narrow glyph')
             narrow_glyphs.append((
                 package_fd.read(2).decode('UTF-16'),
                 ord(package_fd.read(1)),
@@ -178,6 +189,8 @@ class HIIPackage(object):
             ng_count -= 1
         wide_glyphs = []
         while wg_count > 0:
+            if (package_fd.tell() + 44) > len(self._package_blob):
+                raise HIIDBError('Insufficient data for next wide glyph')
             wide_glyphs.append((
                 package_fd.read(2).decode('UTF-16'),
                 ord(package_fd.read(1)),
@@ -186,7 +199,8 @@ class HIIPackage(object):
             ))
             package_fd.seek(3, os.SEEK_CUR)
             wg_count -= 1
-        assert package_fd.tell() == len(self._package_blob)
+        if package_fd.tell() != len(self._package_blob):
+            raise HIIDBError('Simple font package could not be parsed')
         self._package_items = (tuple(narrow_glyphs), tuple(wide_glyphs))
 
     def _parse_forms(self):
@@ -199,8 +213,6 @@ class HIIPackage(object):
                 self._parse_strings()
             elif self._package_type == HIIPackageTypes.DEVICE_PATH:
                 self._parse_device_paths()
-            elif self._package_type == HIIPackageTypes.PACKAGE_END:
-                self._package_items = ()
             elif self._package_type == HIIPackageTypes.SIMPLE_FONTS:
                 self._parse_simple_fonts()
             elif self._package_type == HIIPackageTypes.FORMS:
@@ -240,22 +252,24 @@ class HIIPackageList(object):
         """
         if self._packages is None:
             packages = []
-            start_offset = 20  # 16 bytes GUID + 4 bytes length
-            while start_offset < len(self._pl_blob):
-                if (start_offset+4) > len(self._pl_blob):
+            pl_fd = io.BytesIO(self._pl_blob)
+            pl_fd.seek(20, io.SEEK_SET)  # 16 bytes GUID + 4 bytes length
+            while pl_fd.tell() < len(self._pl_blob):
+                start_offset = pl_fd.tell()
+                if (start_offset + 4) > len(self._pl_blob):
                     raise HIIDBError('Insufficient data for next package header')
-                package_header, = struct.unpack(
-                    '=L', self._pl_blob[start_offset:start_offset+4]
-                )
+                package_header, = struct.unpack('=L', pl_fd.read(4))
                 package_size = package_header & 0xFFFFFF
-                end_offset = start_offset+package_size
-                if end_offset > len(self._pl_blob):
+                if (start_offset + package_size) > len(self._pl_blob):
                     raise HIIDBError('Insufficient data for next package')
                 package_type = HIIPackageTypes((package_header >> 24) & 0xFF)
-                package_blob = self._pl_blob[start_offset:end_offset]
-                packages.append(HIIPackage(package_type, package_blob))
-                start_offset += package_size
-            if start_offset != len(self._pl_blob):
+                if package_type == HIIPackageTypes.PACKAGE_END:
+                    break
+                pl_fd.seek(start_offset)
+                packages.append(HIIPackage(
+                    package_type, pl_fd.read(package_size)
+                ))
+            if pl_fd.tell() != len(self._pl_blob):
                 raise HIIDBError('Package list encoding problem (corrupt data?)')
             self._packages = tuple(packages)
         return self._packages
@@ -269,20 +283,20 @@ class HIIPackageList(object):
         """
         if hii_blob is None:
             hii_blob = read_hii_data()
-        start_offset = 0
         package_lists = []
-        while start_offset < len(hii_blob):
-            if (start_offset+20) > len(hii_blob):
+        hii_blob_fd = io.BytesIO(hii_blob)
+        while hii_blob_fd.tell() < len(hii_blob):
+            start_offset = hii_blob_fd.tell()
+            if (start_offset + 20) > len(hii_blob):
                 raise HIIDBError('Insufficient data for next package list header')
-            package_list_size, = struct.unpack(
-                '=L', hii_blob[start_offset+16:start_offset+20]
-            )
-            end_offset = start_offset + package_list_size
-            if end_offset > len(hii_blob):
+            hii_blob_fd.seek(16, os.SEEK_CUR)
+            package_list_size, = struct.unpack('=L', hii_blob_fd.read(4))
+            if (start_offset + package_list_size) > len(hii_blob):
                 raise HIIDBError('Insufficient data for next package list')
-            package_lists.append(cls(hii_blob[start_offset:end_offset]))
+            hii_blob_fd.seek(start_offset)
+            package_lists.append(cls(hii_blob_fd.read(package_list_size)))
             start_offset += package_list_size
-        if start_offset != len(hii_blob):
+        if hii_blob_fd.tell() != len(hii_blob):
             raise HIIDBError('HII database encoding problem (corrupt data?)')
         return tuple(package_lists)
 
